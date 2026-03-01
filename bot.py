@@ -1,38 +1,55 @@
+
+
+
 import os
-import shutil
-import subprocess
-import tempfile
 import zipfile
-import platform
+import subprocess
 from uuid import uuid4
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    MessageHandler,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
+
+# Create folders
+os.makedirs("files", exist_ok=True)
+os.makedirs("output", exist_ok=True)
+
+# Store user pending zip decisions
+USER_PENDING = {}
+
+MAX_SIZE = 100 * 1024 * 1024   # 100MB
 
 
-# ---------------------- CONFIG ----------------------
-MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
-TOKEN = os.getenv("8562243904:AAF-ht2W0SXIoyn6RURE0BHbfjlT1ykBV5Y")  # Railway uses env variable
-# ----------------------------------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📄 Send me any file (PPT, DOC, ZIP, JPG, XLS) and I will convert it to PDF!\n"
+        "⚠️ Max file size: 100MB"
+    )
 
 
-# Global dictionary to hold user files until they choose ZIP or individual
-USER_FILES = {}
+# -----------------------------
+# PDF Conversion Function
+# -----------------------------
+import platform
 
+def convert_to_pdf(input_file, output_dir="output"):
+    system = platform.system()
 
-# Detect correct LibreOffice path (Windows vs Linux)
-def get_soffice_path():
-    if platform.system() == "Windows":
-        return r"C:\Program Files\LibreOffice\program\soffice.exe"
-    return "/usr/bin/libreoffice"  # Linux / Railway
-
-
-# Convert any supported file to PDF using LibreOffice
-def convert_to_pdf(input_file, output_dir):
-    soffice = get_soffice_path()
+    # Windows path
+    if system == "Windows":
+        soffice_path = r"C:\Program Files\LibreOffice\program\soffice.exe"
+    else:
+        # Linux / Railway path
+        soffice_path = "/usr/bin/libreoffice"
 
     command = [
-        soffice,
+        soffice_path,
         "--headless",
         "--convert-to", "pdf",
         input_file,
@@ -40,163 +57,146 @@ def convert_to_pdf(input_file, output_dir):
     ]
 
     subprocess.run(command, check=True)
-
     base = os.path.basename(input_file)
-    pdf_name = os.path.splitext(base)[0] + ".pdf"
-    return os.path.join(output_dir, pdf_name)
+    name = os.path.splitext(base)[0] + ".pdf"
+    return f"{output_dir}/{name}"
 
 
-# Cleanup helper
-def safe_delete(path):
-    try:
-        if os.path.isfile(path):
-            os.remove(path)
-        elif os.path.isdir(path):
-            shutil.rmtree(path)
-    except:
-        pass
+# -----------------------------
+# ZIP Processing
+# -----------------------------
+async def process_zip(update, file_path):
+    extract_folder = f"files/extracted_{uuid4()}"
+    os.makedirs(extract_folder, exist_ok=True)
 
+    with zipfile.ZipFile(file_path, "r") as zip_ref:
+        zip_ref.extractall(extract_folder)
 
-# /start command
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Find all files inside
+    file_list = []
+    for root, dirs, files in os.walk(extract_folder):
+        for f in files:
+            file_list.append(os.path.join(root, f))
+
+    if len(file_list) == 0:
+        await update.message.reply_text("❌ ZIP file is empty.")
+        return
+
+    if len(file_list) == 1:
+        # Only one file → convert directly
+        pdf_path = convert_to_pdf(file_list[0])
+        await update.message.reply_document(open(pdf_path, "rb"))
+        return
+
+    # Multiple files → Ask user
+    USER_PENDING[update.effective_user.id] = file_list
+
+    buttons = [
+        [
+            InlineKeyboardButton("📁 Get ZIP of all PDFs", callback_data="zip_all"),
+            InlineKeyboardButton("📄 Send PDFs individually", callback_data="single_all"),
+        ]
+    ]
+
     await update.message.reply_text(
-        "👋 Welcome! Send me PPTX, PPT, DOCX, DOC, XLSX, ODT, ZIP or any office file and I’ll convert it to PDF.\n\n"
-        "📌 Max file size: 100MB\n"
-        "📦 Send multiple files → choose ZIP or individual PDFs.\n"
+        "This ZIP contains multiple files. What do you want?",
+        reply_markup=InlineKeyboardMarkup(buttons)
     )
 
 
-# Handle document upload
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    doc = update.message.document
-
-    # Check size
-    if doc.file_size > MAX_FILE_SIZE:
-        await update.message.reply_text("❌ File too large! Max 100MB.")
-        return
-
-    await update.message.reply_text("📥 Uploading your file…")
-
-    # Download file
-    file = await doc.get_file()
-
-    temp_dir = tempfile.mkdtemp()
-    file_path = os.path.join(temp_dir, doc.file_name)
-
-    await file.download_to_drive(file_path)
-
-    # Store files per user
-    if user_id not in USER_FILES:
-        USER_FILES[user_id] = []
-
-    USER_FILES[user_id].append(file_path)
-
-    # If only one file → convert immediately
-    if len(USER_FILES[user_id]) == 1:
-        keyboard = [
-            [InlineKeyboardButton("Convert This File", callback_data="convert_single")],
-            [InlineKeyboardButton("Upload More Files", callback_data="more_files")],
-        ]
-        await update.message.reply_text("📄 File received! What do you want to do?", reply_markup=InlineKeyboardMarkup(keyboard))
-    else:
-        # Multiple files → ask ZIP or individual
-        keyboard = [
-            [InlineKeyboardButton("Convert All → ZIP", callback_data="convert_zip")],
-            [InlineKeyboardButton("Convert All → Individual PDFs", callback_data="convert_individual")],
-        ]
-        await update.message.reply_text(
-            f"📦 {len(USER_FILES[user_id])} files received! Choose an option:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-
-
-# Handle button actions
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# -----------------------------
+# User Choice Callback
+# -----------------------------
+async def zip_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    user_id = query.from_user.id
     await query.answer()
 
-    if user_id not in USER_FILES or not USER_FILES[user_id]:
-        await query.edit_message_text("❌ No files found. Upload a file first.")
+    files = USER_PENDING.get(update.effective_user.id)
+    if not files:
+        await query.edit_message_text("Session expired. Please send ZIP again.")
         return
 
-    files = USER_FILES[user_id]
-
-    if query.data == "more_files":
-        await query.edit_message_text("📤 Okay! Send more files.")
-        return
-
-    # Single file conversion
-    if query.data == "convert_single":
-        await query.edit_message_text("⚙️ Converting your file…")
-
-        file_path = files[0]
-        output_dir = tempfile.mkdtemp()
-
-        try:
-            pdf_path = convert_to_pdf(file_path, output_dir)
-            await query.message.reply_document(open(pdf_path, "rb"))
-        except Exception as e:
-            await query.edit_message_text(f"❌ Conversion error: {e}")
-        finally:
-            safe_delete(output_dir)
-            safe_delete(os.path.dirname(file_path))
-            USER_FILES[user_id] = []
-        return
-
-    # Convert all → Individual PDFs
-    if query.data == "convert_individual":
-        await query.edit_message_text("⚙️ Converting all files…")
-
-        output_dir = tempfile.mkdtemp()
-        try:
+    if query.data == "zip_all":
+        # Convert all → zip
+        zip_out = f"output/{uuid4()}.zip"
+        with zipfile.ZipFile(zip_out, "w") as z:
             for f in files:
-                pdf_path = convert_to_pdf(f, output_dir)
-                await query.message.reply_document(open(pdf_path, "rb"))
-        except Exception as e:
-            await query.edit_message_text(f"❌ Conversion error: {e}")
-        finally:
-            safe_delete(output_dir)
-            for f in files:
-                safe_delete(os.path.dirname(f))
-            USER_FILES[user_id] = []
+                pdf = convert_to_pdf(f)
+                z.write(pdf, os.path.basename(pdf))
+
+        await query.edit_message_text("📦 Creating ZIP...")
+        await query.message.reply_document(open(zip_out, "rb"))
+
+        os.remove(zip_out)
+
+    elif query.data == "single_all":
+        await query.edit_message_text("📄 Sending PDFs individually...")
+        for f in files:
+            pdf = convert_to_pdf(f)
+            await query.message.reply_document(open(pdf, "rb"))
+
+    USER_PENDING.pop(update.effective_user.id, None)
+
+
+# -----------------------------
+# File Handler
+# -----------------------------
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document
+
+    # -----------------------------
+    # Check file size
+    # -----------------------------
+    if doc.file_size > MAX_SIZE:
+        await update.message.reply_text("❌ File too large! Max allowed: 100MB.")
         return
 
-    # Convert all → ZIP
-    if query.data == "convert_zip":
-        await query.edit_message_text("⚙️ Converting all files and creating ZIP…")
+    # -----------------------------
+    # Begin message
+    # -----------------------------
+    status = await update.message.reply_text("📥 Downloading file...")
 
-        output_dir = tempfile.mkdtemp()
-        zip_path = os.path.join(output_dir, f"converted_{uuid4()}.zip")
+    file = await doc.get_file()
 
-        try:
-            with zipfile.ZipFile(zip_path, "w") as zipf:
-                for f in files:
-                    pdf_path = convert_to_pdf(f, output_dir)
-                    zipf.write(pdf_path, os.path.basename(pdf_path))
+    file_id = uuid4()
+    file_path = f"files/{doc.file_name}"
+    await file.download_to_drive(file_path)
 
-            await query.message.reply_document(open(zip_path, "rb"))
-        except Exception as e:
-            await query.edit_message_text(f"❌ Error: {e}")
-        finally:
-            safe_delete(output_dir)
-            for f in files:
-                safe_delete(os.path.dirname(f))
-            USER_FILES[user_id] = []
+    await status.edit_text("⚙️ Converting file...")
+
+    # -----------------------------
+    # ZIP HANDLING
+    # -----------------------------
+    if file_path.endswith(".zip"):
+        await process_zip(update, file_path)
         return
 
+    # -----------------------------
+    # Normal conversion
+    # -----------------------------
+    try:
+        pdf_path = convert_to_pdf(file_path)
 
-# Main
-def main():
-    app = Application.builder().token(TOKEN).build()
+        await status.edit_text("📤 Uploading PDF...")
+        await update.message.reply_document(open(pdf_path, "rb"))
+
+    except Exception as e:
+        await status.edit_text(f"❌ Conversion error: {e}")
+
+
+# -----------------------------
+# MAIN
+# -----------------------------
+def run():
+    app = ApplicationBuilder().token("8562243904:AAF-ht2W0SXIoyn6RURE0BHbfjlT1ykBV5Y").build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
+    app.add_handler(CallbackQueryHandler(zip_decision))
 
+    print("Bot running…")
     app.run_polling()
 
 
 if __name__ == "__main__":
-    main()
+    run()
