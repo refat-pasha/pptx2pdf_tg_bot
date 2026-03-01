@@ -33,16 +33,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -----------------------------
 # PDF Conversion Function
 # -----------------------------
+import platform
+
 def convert_to_pdf(input_file, output_dir="output"):
+    system = platform.system()
+
+    # Windows path
+    if system == "Windows":
+        soffice_path = r"C:\Program Files\LibreOffice\program\soffice.exe"
+    else:
+        # Linux / Railway path
+        soffice_path = "/usr/bin/libreoffice"
+
     command = [
-    r"C:\Program Files\LibreOffice\program\soffice.exe",
-    "--headless",
-    "--convert-to",
-    "pdf",
-    input_file,
-    "--outdir",
-    output_dir,
-]
+        soffice_path,
+        "--headless",
+        "--convert-to", "pdf",
+        input_file,
+        "--outdir", output_dir,
+    ]
+
     subprocess.run(command, check=True)
     base = os.path.basename(input_file)
     name = os.path.splitext(base)[0] + ".pdf"
