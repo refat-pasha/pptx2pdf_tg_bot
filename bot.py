@@ -296,7 +296,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MAIN RUN
 # ───────────────────────────────────────────────
 def run():
-    app = ApplicationBuilder().token("YOUR_BOT_TOKEN_HERE").build()
+    app = ApplicationBuilder().token("8562243904:AAF-ht2W0SXIoyn6RURE0BHbfjlT1ykBV5Y").build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
