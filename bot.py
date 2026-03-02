@@ -4,12 +4,12 @@ import subprocess
 from uuid import uuid4
 import platform
 from PIL import Image
+import asyncio
 
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    InputFile,
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -20,47 +20,49 @@ from telegram.ext import (
     filters,
 )
 
-# Create directories
+# ───────────────────────────────────────────────
+# CREATE DIRECTORIES
+# ───────────────────────────────────────────────
 os.makedirs("files", exist_ok=True)
 os.makedirs("output", exist_ok=True)
 
-MAX_SIZE = 100 * 1024 * 1024  # 100MB
-
-# Store waiting decisions
-USER_PENDING_ZIP = {}
-USER_PENDING_IMAGES = {}  # store images before merge decision
+MAX_SIZE = 100 * 1024 * 1024   # 100MB
 
 
-# -----------------------------
+# ───────────────────────────────────────────────
+# MEMORY STRUCTURES
+# ───────────────────────────────────────────────
+
+USER_IMAGE_BUFFER = {}        # {user_id: [img1, img2, ...]}
+USER_LAST_IMAGE_TIME = {}     # {user_id: timestamp}
+USER_AWAITING_PDFNAME = {}    # {user_id: [img paths]}
+
+
+# ───────────────────────────────────────────────
 # START COMMAND
-# -----------------------------
+# ───────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📄 Send me PPT/DOC/JPG/PNG/ZIP and I will convert to PDF!\n"
-        "🖼 Multiple images = I will ask if you want to merge.\n"
-        "⚠ Max file size: 100MB."
+        "📄 Send PPT/DOC/ZIP/JPG/PNG and I will convert to PDF!\n"
+        "🖼 Multiple images → I will auto-detect and ask for PDF name.\n"
+        "⚠  Max file size: 100MB."
     )
 
 
-# -----------------------------
-# DOCUMENT → PDF
-# -----------------------------
+# ───────────────────────────────────────────────
+# DOCUMENT → PDF (LibreOffice)
+# ───────────────────────────────────────────────
 def convert_to_pdf(input_file, output_dir="output"):
     system = platform.system()
-
     if system == "Windows":
         soffice_path = r"C:\Program Files\LibreOffice\program\soffice.exe"
     else:
         soffice_path = "/usr/bin/libreoffice"
 
     command = [
-        soffice_path,
-        "--headless",
-        "--convert-to",
-        "pdf",
-        input_file,
-        "--outdir",
-        output_dir,
+        soffice_path, "--headless",
+        "--convert-to", "pdf",
+        input_file, "--outdir", output_dir
     ]
 
     subprocess.run(command, check=True)
@@ -70,41 +72,37 @@ def convert_to_pdf(input_file, output_dir="output"):
     return f"{output_dir}/{name}"
 
 
-# -----------------------------
-# IMAGE → SINGLE-PAGE A4 PDF
-# -----------------------------
+# ───────────────────────────────────────────────
+# SINGLE IMAGE → PDF
+# ───────────────────────────────────────────────
 def image_to_pdf(image_path, output_path):
-    A4_WIDTH, A4_HEIGHT = 595, 842  # Portrait
+    A4_WIDTH, A4_HEIGHT = 595, 842
 
-    image = Image.open(image_path).convert("RGB")
-    w, h = image.size
+    img = Image.open(image_path).convert("RGB")
+    w, h = img.size
 
-    # Scale down if larger than page
     scale = min(A4_WIDTH / w, A4_HEIGHT / h, 1)
     new_w = int(w * scale)
     new_h = int(h * scale)
-    image = image.resize((new_w, new_h), Image.LANCZOS)
+    img = img.resize((new_w, new_h), Image.LANCZOS)
 
-    # Create white A4 page
     page = Image.new("RGB", (A4_WIDTH, A4_HEIGHT), "white")
-
-    # Center the image
     x = (A4_WIDTH - new_w) // 2
     y = (A4_HEIGHT - new_h) // 2
+    page.paste(img, (x, y))
 
-    page.paste(image, (x, y))
     page.save(output_path)
 
 
-# -----------------------------
-# MULTI-IMAGE MERGE → PDF
-# -----------------------------
+# ───────────────────────────────────────────────
+# MULTI IMAGE MERGE → PDF
+# ───────────────────────────────────────────────
 def merge_images_to_pdf(image_list, output_path):
     A4_WIDTH, A4_HEIGHT = 595, 842
-
     pages = []
-    for img_path in image_list:
-        img = Image.open(img_path).convert("RGB")
+
+    for path in image_list:
+        img = Image.open(path).convert("RGB")
         w, h = img.size
 
         scale = min(A4_WIDTH / w, A4_HEIGHT / h, 1)
@@ -116,171 +114,158 @@ def merge_images_to_pdf(image_list, output_path):
         x = (A4_WIDTH - new_w) // 2
         y = (A4_HEIGHT - new_h) // 2
         page.paste(img, (x, y))
-
         pages.append(page)
 
     pages[0].save(output_path, save_all=True, append_images=pages[1:])
 
 
-# -----------------------------
+# ───────────────────────────────────────────────
 # ZIP PROCESSING
-# -----------------------------
+# ───────────────────────────────────────────────
 async def process_zip(update, file_path):
-    extract_folder = f"files/extracted_{uuid4()}"
-    os.makedirs(extract_folder, exist_ok=True)
+    extract_dir = f"files/extracted_{uuid4()}"
+    os.makedirs(extract_dir, exist_ok=True)
 
-    with zipfile.ZipFile(file_path, "r") as zip_ref:
-        zip_ref.extractall(extract_folder)
+    with zipfile.ZipFile(file_path, "r") as z:
+        z.extractall(extract_dir)
 
-    file_list = []
-    for root, _, files in os.walk(extract_folder):
+    items = []
+    for root, _, files in os.walk(extract_dir):
         for f in files:
-            file_list.append(os.path.join(root, f))
+            items.append(os.path.join(root, f))
 
-    if not file_list:
+    if not items:
         await update.message.reply_text("❌ ZIP is empty.")
         return
 
-    if len(file_list) == 1:
-        pdf = convert_to_pdf(file_list[0])
+    if len(items) == 1:
+        pdf = convert_to_pdf(items[0])
         await update.message.reply_document(open(pdf, "rb"))
         return
 
-    USER_PENDING_ZIP[update.effective_user.id] = file_list
-
-    btns = [
+    buttons = [
         [
             InlineKeyboardButton("📦 ZIP all PDFs", callback_data="zip_all"),
-            InlineKeyboardButton("📄 PDFs individually", callback_data="single_all"),
+            InlineKeyboardButton("📄 PDFs one by one", callback_data="zip_single")
         ]
     ]
 
     await update.message.reply_text(
-        "ZIP contains multiple files. Choose an option:",
-        reply_markup=InlineKeyboardMarkup(btns),
+        "ZIP contains multiple files:",
+        reply_markup=InlineKeyboardMarkup(buttons)
     )
 
+    # Store list for later
+    update.user_data["zip_files"] = items
 
-# -----------------------------
-# ZIP DECISION CALLBACK
-# -----------------------------
+
+# ───────────────────────────────────────────────
+# ZIP DECISION
+# ───────────────────────────────────────────────
 async def zip_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
-    files = USER_PENDING_ZIP.get(update.effective_user.id)
+    files = update.user_data.get("zip_files")
     if not files:
         await q.edit_message_text("Session expired. Send ZIP again.")
         return
 
     if q.data == "zip_all":
-        zip_out = f"output/{uuid4()}.zip"
-        with zipfile.ZipFile(zip_out, "w") as z:
+        out_zip = f"output/{uuid4()}.zip"
+        with zipfile.ZipFile(out_zip, "w") as z:
             for f in files:
                 pdf = convert_to_pdf(f)
                 z.write(pdf, os.path.basename(pdf))
 
-        await q.edit_message_text("📦 Creating ZIP...")
-        await q.message.reply_document(open(zip_out, "rb"))
-        os.remove(zip_out)
+        await q.message.reply_document(open(out_zip, "rb"))
+        os.remove(out_zip)
 
     else:
-        await q.edit_message_text("📄 Sending individually…")
         for f in files:
             pdf = convert_to_pdf(f)
             await q.message.reply_document(open(pdf, "rb"))
 
-    USER_PENDING_ZIP.pop(update.effective_user.id, None)
+    update.user_data["zip_files"] = None
 
 
-# -----------------------------
-# PHOTO HANDLER (SINGLE / MULTI)
-# -----------------------------
+# ───────────────────────────────────────────────
+# IMAGE HANDLER (MAIN LOGIC)
+# ───────────────────────────────────────────────
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
 
-    # Create user list if not exists
-    if uid not in USER_PENDING_IMAGES:
-        USER_PENDING_IMAGES[uid] = []
-
     # Download image
-    photo = update.message.photo[-1]
-    file = await photo.get_file()
+    file = await update.message.photo[-1].get_file()
     img_path = f"files/{uuid4()}.jpg"
     await file.download_to_drive(img_path)
 
-    USER_PENDING_IMAGES[uid].append(img_path)
+    # Append image
+    USER_IMAGE_BUFFER.setdefault(uid, []).append(img_path)
+    USER_LAST_IMAGE_TIME[uid] = asyncio.get_event_loop().time()
 
-    # If only one image received so far → ask user if they want to keep sending
-    if len(USER_PENDING_IMAGES[uid]) == 1:
-        await update.message.reply_text(
-            "🖼 You sent an image.\n"
-            "Send more images OR choose an option:",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("➡ Convert this only", callback_data="img_single"),
-                    InlineKeyboardButton("📚 Merge all images", callback_data="img_merge"),
-                ]
-            ])
-        )
+    # Start 3-second timer task (non-blocking)
+    asyncio.create_task(wait_for_images(uid, update, context))
+
+
+# ───────────────────────────────────────────────
+# WAIT FOR 3s NO NEW IMAGES
+# ───────────────────────────────────────────────
+async def wait_for_images(uid, update, context):
+    last_time = USER_LAST_IMAGE_TIME[uid]
+    await asyncio.sleep(3)
+
+    # If user sent another image meanwhile → cancel
+    if USER_LAST_IMAGE_TIME.get(uid) != last_time:
         return
 
-    # More than one → ask again
-    await update.message.reply_text(
-        f"🖼 Received {len(USER_PENDING_IMAGES[uid])} images.\nChoose an option:",
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("📚 Merge images", callback_data="img_merge"),
-                InlineKeyboardButton("📄 Convert individually", callback_data="img_multi_single"),
-            ]
-        ])
-    )
+    # Retrieve collected images
+    images = USER_IMAGE_BUFFER.get(uid, [])
+
+    # SINGLE IMAGE
+    if len(images) == 1:
+        original_name = os.path.splitext(update.message.photo[-1].file_unique_id)[0]
+        pdf_path = f"output/{original_name}.pdf"
+        image_to_pdf(images[0], pdf_path)
+
+        await update.message.reply_document(open(pdf_path, "rb"))
+
+        USER_IMAGE_BUFFER.pop(uid, None)
+        USER_LAST_IMAGE_TIME.pop(uid, None)
+        return
+
+    # MULTIPLE IMAGES — ASK FOR NAME
+    USER_AWAITING_PDFNAME[uid] = images
+    await update.message.reply_text("📘 Multiple images received.\nSend PDF name:")
 
 
-# -----------------------------
-# IMAGE DECISION CALLBACK
-# -----------------------------
-async def image_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-
+# ───────────────────────────────────────────────
+# USER PROVIDES PDF NAME
+# ───────────────────────────────────────────────
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    imgs = USER_PENDING_IMAGES.get(uid)
 
-    if not imgs:
-        await q.edit_message_text("❌ No images found. Send again.")
-        return
+    if uid not in USER_AWAITING_PDFNAME:
+        return  # not naming a PDF
 
-    if q.data == "img_single":
-        # Convert first image only
-        out = f"output/{uuid4()}.pdf"
-        image_to_pdf(imgs[0], out)
-        await q.edit_message_text("📄 Converting image…")
-        await q.message.reply_document(open(out, "rb"))
-        USER_PENDING_IMAGES.pop(uid, None)
-        return
+    images = USER_AWAITING_PDFNAME.pop(uid)
+    name_raw = update.message.text.strip()
 
-    if q.data == "img_multi_single":
-        await q.edit_message_text("📄 Sending images individually…")
-        for img in imgs:
-            out = f"output/{uuid4()}.pdf"
-            image_to_pdf(img, out)
-            await q.message.reply_document(open(out, "rb"))
-        USER_PENDING_IMAGES.pop(uid, None)
-        return
+    pdf_name = name_raw + ".pdf"
+    out_path = f"output/{pdf_name}"
 
-    if q.data == "img_merge":
-        merged_pdf = f"output/{uuid4()}.pdf"
-        merge_images_to_pdf(imgs, merged_pdf)
-        await q.edit_message_text("📚 Merging images into PDF…")
-        await q.message.reply_document(open(merged_pdf, "rb"))
-        USER_PENDING_IMAGES.pop(uid, None)
-        return
+    merge_images_to_pdf(images, out_path)
+
+    await update.message.reply_document(open(out_path, "rb"))
+
+    # full cleanup
+    USER_IMAGE_BUFFER.pop(uid, None)
+    USER_LAST_IMAGE_TIME.pop(uid, None)
 
 
-# -----------------------------
-# DOCUMENT/FILE HANDLER
-# -----------------------------
+# ───────────────────────────────────────────────
+# DOCUMENT HANDLER
+# ───────────────────────────────────────────────
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
 
@@ -288,13 +273,13 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ File too large (max 100MB).")
         return
 
-    status = await update.message.reply_text("📥 Downloading file…")
+    status = await update.message.reply_text("📥 Downloading…")
 
     file = await doc.get_file()
     file_path = f"files/{doc.file_name}"
     await file.download_to_drive(file_path)
 
-    await status.edit_text("⚙️ Converting…")
+    await status.edit_text("⚙ Converting…")
 
     if file_path.endswith(".zip"):
         await process_zip(update, file_path)
@@ -302,26 +287,23 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         pdf = convert_to_pdf(file_path)
-        await status.edit_text("📤 Uploading PDF…")
         await update.message.reply_document(open(pdf, "rb"))
     except Exception as e:
-        await status.edit_text(f"❌ Conversion error: {e}")
+        await status.edit_text(f"❌ Error: {e}")
 
 
-# -----------------------------
+# ───────────────────────────────────────────────
 # MAIN RUN
-# -----------------------------
+# ───────────────────────────────────────────────
 def run():
-    app = ApplicationBuilder().token("8562243904:AAF-ht2W0SXIoyn6RURE0BHbfjlT1ykBV5Y").build()
+    app = ApplicationBuilder().token("YOUR_BOT_TOKEN_HERE").build()
 
     app.add_handler(CommandHandler("start", start))
-
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
-
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
+    app.add_handler(MessageHandler(filters.TEXT, handle_text))
 
     app.add_handler(CallbackQueryHandler(zip_decision, pattern="zip"))
-    app.add_handler(CallbackQueryHandler(image_decision, pattern="img"))
 
     print("Bot running…")
     app.run_polling()
